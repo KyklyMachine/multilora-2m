@@ -31,7 +31,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLTextDecoderLayer,
     Qwen3VLTextRMSNorm,
 )
-from peft import PeftModel
+from peft import PeftConfig, PeftModel
 from safetensors.torch import load_file, save_file
 
 
@@ -133,8 +133,19 @@ class MultiLoRAEmbedder:
 
         head_base = HeadModel.from_pretrained(head_path, dtype=dtype, device=device)
         names = list(adapter_paths)
+
+        # The adapters were trained against the full CausalLM model, so their
+        # configs carry `task_type="CAUSAL_LM"`. That routes PEFT to
+        # `PeftModelForCausalLM`, which requires generation-related methods
+        # on the wrapped module (we have none — the head is a feature
+        # extractor). Force the base `PeftModel` wrapper by blanking out
+        # `task_type`; subsequent `load_adapter` calls don't change the
+        # wrapper class, so we only need this on the first one.
+        peft_cfg = PeftConfig.from_pretrained(adapter_paths[names[0]])
+        peft_cfg.task_type = None
         self.head = PeftModel.from_pretrained(
-            head_base, adapter_paths[names[0]], adapter_name=names[0],
+            head_base, adapter_paths[names[0]],
+            adapter_name=names[0], config=peft_cfg,
         )
         for n in names[1:]:
             self.head.load_adapter(adapter_paths[n], adapter_name=n)
