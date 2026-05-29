@@ -1,28 +1,18 @@
 """
-Multi-LoRA shared-backbone inference for a Qwen3-VL embedder.
+Multi-LoRA shared-backbone inference for a Qwen3-VL embedder. (FlashAttention-2)
 
 Idea:
   - Run layers [0 .. split) once  -> heavy shared backbone.
-  - Run layers [split .. end] + final norm + pool for every LoRA adapter.
+  - For each LoRA adapter, run layers [split .. end] + final norm + pool
+    with that adapter active. Cost grows with N, but only over the cheap tail.
 
-Two head strategies live here:
-  * `_run_head`          — sequential: set_adapter -> 8 layers, once per adapter.
-                           Kept as the numerical reference.
-  * `_run_head_batched`  — fan-out: replicate the backbone hidden state to a
-                           batch of N*B and run the tail ONCE, routing each
-                           sub-batch to its adapter via PEFT mixed-batch
-                           (`_enable_peft_forward_hooks(adapter_names=...)`).
-                           The shared base GEMMs run once over the whole N*B
-                           batch; only the tiny rank-16 LoRA deltas are
-                           per-adapter. Same FLOPs as the loop, but one big
-                           batched kernel instead of N launch-bound passes.
+This is the original single-model version with FlashAttention-2 enabled.
+The only substantive changes vs the first cut:
+  * `attn_implementation` is passed at load time (default "flash_attention_2").
+  * pooling now uses `attention_mask` to pick the last *real* token, so it is
+    correct under batching + padding (FA2 path relies on the 2D padding mask).
 
-Tiling note (verified against the modeling source):
-  hidden [B, seq, h], attention_mask [B, 1, q, kv] (sdpa) and position_ids
-  [B, seq] all carry batch on dim 0; rotary cos/sin are [B, seq, head_dim]
-  (the mrope "3" axis is collapsed by apply_interleaved_mrope) — also dim 0.
-  cache_position is [seq] with no batch axis. So: tile dim 0 for every tensor
-  with ndim >= 2, pass 1-D tensors through unchanged.
+No cross-adapter batching yet — that is the next optimization.
 """
 
 from __future__ import annotations
@@ -44,16 +34,13 @@ class MultiLoRAEmbedder:
         split_layer: int = 28,
         dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
-        attn_implementation: str = "sdpa",
+        attn_implementation: str = "flash_attention_2",
     ):
         self.processor = AutoProcessor.from_pretrained(base_model, trust_remote_code=True)
 
-        # `attn_implementation` is applied to the whole model (vision + text).
-        # "sdpa" dispatches to a flash/mem-efficient kernel internally, without
-        # the transformers FA2 unpad/repad overhead — for prefill-only embedding
-        # over short/medium sequences it tends to match or beat "flash_attention_2",
-        # and it composes with torch.compile. Use "flash_attention_2" only if you
-        # move to long sequences + large padded batches.
+        # FA2 requires fp16/bf16 weights. `attn_implementation` is applied to the
+        # whole model (vision + text). Fall back to "sdpa" if flash-attn is not
+        # installed / not supported on your GPU.
         base = Qwen3VLForConditionalGeneration.from_pretrained(
             base_model,
             torch_dtype=dtype,
@@ -100,25 +87,7 @@ class MultiLoRAEmbedder:
             raise AttributeError("cannot locate decoder module with .layers")
         return result
 
-    # ---------- preprocessing ----------
-
-    def _prepare(self, messages, images=None, **processor_kwargs):
-        """messages -> (model_inputs on device, attention_mask)."""
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        if isinstance(text, str):
-            text = [text]
-        model_inputs = self.processor(
-            text=text,
-            images=images,
-            return_tensors="pt",
-            padding=True,
-            **processor_kwargs,
-        ).to(self.model.device)
-        return model_inputs, model_inputs["attention_mask"]
-
-    # ---------- backbone ----------
+    # ---------- two-stage forward ----------
 
     @torch.inference_mode()
     def _run_backbone(self, model_inputs: dict) -> tuple[torch.Tensor, dict]:
@@ -126,6 +95,10 @@ class MultiLoRAEmbedder:
         Run the full model up to layer[split] by short-circuiting with a hook.
         HF handles all multimodal fusion + mask/position-id prep for us;
         we just capture what layer[split] would have received as input.
+
+        Under FA2 the captured `attention_mask` is whatever HF actually passes
+        the decoder layers (2D padding mask or None) — so the head replay stays
+        consistent with the attention backend automatically.
         """
         captured: dict = {}
 
@@ -147,8 +120,6 @@ class MultiLoRAEmbedder:
             handle.remove()
         return captured["hidden"], captured["kwargs"]
 
-    # ---------- head: sequential (reference) ----------
-
     @torch.inference_mode()
     def _run_head(
         self,
@@ -165,55 +136,13 @@ class MultiLoRAEmbedder:
         h = self.final_norm(h)
         return self._pool(h, attention_mask)
 
-    # ---------- head: batched fan-out ----------
-
-    @staticmethod
-    def _tile_batch(t, n: int):
-        """Tile dim-0 n times for tensors with a batch axis; pass others through."""
-        if torch.is_tensor(t):
-            return t.repeat(n, *([1] * (t.ndim - 1))) if t.ndim >= 2 else t
-        if isinstance(t, tuple):
-            return tuple(MultiLoRAEmbedder._tile_batch(x, n) for x in t)
-        return t
-
-    def _tile_kwargs(self, layer_kwargs: dict, n: int) -> dict:
-        return {k: self._tile_batch(v, n) for k, v in layer_kwargs.items()}
-
-    @torch.inference_mode()
-    def _run_head_batched(
-        self,
-        hidden: torch.Tensor,
-        layer_kwargs: dict,
-        attention_mask: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """All adapters in a single N*B pass. Returns {name: tensor[B, hidden]}."""
-        names = self.adapter_names
-        n, b = len(names), hidden.shape[0]
-
-        # Block layout: rows [k*B : (k+1)*B] are copy k -> adapter k.
-        h = hidden.repeat(n, *([1] * (hidden.ndim - 1)))
-        tiled = self._tile_kwargs(layer_kwargs, n)
-        attn = attention_mask.repeat(n, *([1] * (attention_mask.ndim - 1)))
-        adapter_names = [name for name in names for _ in range(b)]
-
-        # Mixed-batch: base GEMM once over N*B, per-adapter LoRA delta per sub-batch.
-        with self.model.base_model._enable_peft_forward_hooks(adapter_names=adapter_names):
-            for layer in self.layers[self.split:]:
-                out = layer(h, **tiled)
-                h = out[0] if isinstance(out, tuple) else out
-            h = self.final_norm(h)
-
-        pooled = self._pool(h, attn)  # [N*B, hidden]
-        return {name: pooled[i * b:(i + 1) * b] for i, name in enumerate(names)}
-
-    # ---------- pooling ----------
-
     @staticmethod
     def _pool(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Last *real* token per row.
 
         Assumes right padding (the Qwen-VL processor default) or batch=1, where
-        the last non-pad token is at index `sum(mask) - 1`.
+        the last non-pad token is at index `sum(mask) - 1`. This is the correct
+        replacement for `hidden[:, -1, :]` once you batch padded inputs.
         """
         last_idx = attention_mask.sum(dim=1).clamp(min=1) - 1
         rows = torch.arange(hidden.shape[0], device=hidden.device)
@@ -226,22 +155,35 @@ class MultiLoRAEmbedder:
         self,
         messages,
         images=None,
-        batched: bool = True,
         **processor_kwargs,
     ) -> dict[str, torch.Tensor]:
         """
-        One backbone pass, then the head for every loaded adapter.
+        One backbone pass, then one head pass per loaded adapter.
 
-        batched=True  -> single N*B fan-out pass (fast, default).
-        batched=False -> sequential per-adapter loop (reference).
+        messages: OpenAI-style chat messages — single conversation (list of
+                  dicts) or a batch (list of such lists).
+        images:   PIL image or list of PIL images, forwarded to the processor.
+        processor_kwargs: extra args forwarded to the processor call
+                  (e.g. videos=..., padding=...).
 
         Returns {adapter_name: tensor[B, hidden]}.
         """
-        model_inputs, attention_mask = self._prepare(messages, images, **processor_kwargs)
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        if isinstance(text, str):
+            text = [text]
+        model_inputs = self.processor(
+            text=text,
+            images=images,
+            return_tensors="pt",
+            padding=True,
+            **processor_kwargs,
+        ).to(self.model.device)
+        attention_mask = model_inputs["attention_mask"]
+
         hidden, layer_kwargs = self._run_backbone(model_inputs)
 
-        if batched:
-            return self._run_head_batched(hidden, layer_kwargs, attention_mask)
         return {
             name: self._run_head(hidden, layer_kwargs, attention_mask, name)
             for name in self.adapter_names
